@@ -1,0 +1,160 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="UTF-8" />
+<title>Space Invaders — 3 Lives & Explosions</title>
+<style>
+  body { background: #000; color: #0f0; font-family: monospace; text-align: center; }
+  canvas { background: #111; border: 2px solid #0f0; margin-top: 20px; display: block; margin-left: auto; margin-right: auto; }
+</style>
+</head>
+<body>
+<h1>👾 Space Invaders — Lives & Explosions</h1>
+<canvas id="game" width="800" height="600"></canvas>
+<script>
+const canvas = document.getElementById('game');
+const ctx = canvas.getContext('2d');
+
+let score = 0, wave = 1, gameOver = false;
+let lives = 3;
+const player = { x: 380, y: 550, width: 40, height: 20, speed: 260, bullets: [], moveDir: 0, alive: true };
+let enemies = [], enemyBullets = [], explosions = [];
+let enemyDir = 1, lastT = performance.now();
+const enemyW = 40, enemyH = 22, spacingX = 16, spacingY = 16;
+let baseEnemySpeed = 70, baseEnemyBulletSpeed = 180, baseFireChance = 0.008, sineAmp = 10, sineSpd = 2.0;
+
+function getWaveConfig(w) {
+  return {
+    rows: Math.min(5 + Math.floor((w - 1) / 2), 8),
+    cols: 10,
+    speed: 70 + 18 * (w - 1),
+    bulletSpeed: 180 + 12 * (w - 1),
+    fireChance: 0.008 + 0.002 * (w - 1),
+    sineAmp: Math.min(10 + 1.5 * (w - 1), 20),
+    sineSpd: 2.0 + 0.15 * (w - 1)
+  };
+}
+
+function spawnWave() {
+  const cfg = getWaveConfig(wave);
+  baseEnemySpeed = cfg.speed;
+  baseEnemyBulletSpeed = cfg.bulletSpeed;
+  baseFireChance = cfg.fireChance;
+  sineAmp = cfg.sineAmp;
+  sineSpd = cfg.sineSpd;
+  enemies = [];
+  enemyBullets = [];
+  enemyDir = 1;
+  const totalWidth = cfg.cols * enemyW + (cfg.cols - 1) * spacingX;
+  const startX = (canvas.width - totalWidth) / 2;
+  const startY = 60;
+  for (let r = 0; r < cfg.rows; r++) {
+    for (let c = 0; c < cfg.cols; c++) {
+      enemies.push({ row: r, col: c, baseX: startX + c * (enemyW + spacingX), baseY: startY + r * (enemyH + spacingY), alive: true, phase: Math.random() * Math.PI * 2, x: 0, y: 0 });
+    }
+  }
+}
+
+function getEnemyRect(e, t) {
+  const wobble = sineAmp * Math.sin(t * sineSpd + e.phase);
+  return { x: e.baseX + wobble, y: e.baseY, width: enemyW, height: enemyH };
+}
+
+function rectsOverlap(a, b) {
+  return a.x < b.x + b.width && a.x + a.width > b.x && a.y < b.y + b.height && a.y + a.height > b.y;
+}
+
+function bottomShooters(t) {
+  const byCol = new Map();
+  for (const e of enemies) {
+    if (!e.alive) continue;
+    const r = getEnemyRect(e, t);
+    if (!byCol.has(e.col) || r.y > byCol.get(e.col).y) byCol.set(e.col, r);
+  }
+  return [...byCol.values()];
+}
+
+function aimBulletFrom(shooterRect) {
+  const sCx = shooterRect.x + shooterRect.width / 2, sCy = shooterRect.y + shooterRect.height;
+  const pCx = player.x + player.width / 2, pCy = player.y;
+  const dy = pCy - sCy; 
+  const timeToReach = dy / baseEnemyBulletSpeed;
+  const predictedX = pCx + player.moveDir * player.speed * timeToReach * 0.8;
+  const dx = predictedX - sCx, len = Math.hypot(dx, dy) || 1;
+  return { x: sCx - 2, y: sCy, width: 4, height: 10, vx: (dx / len) * baseEnemyBulletSpeed, vy: (dy / len) * baseEnemyBulletSpeed };
+}
+
+function spawnExplosion(x, y, color='#ff0') {
+  for (let i = 0; i < 15; i++) {
+    const angle = Math.random() * Math.PI * 2, speed = Math.random() * 100 + 50;
+    explosions.push({ x, y, vx: Math.cos(angle) * speed, vy: Math.sin(angle) * speed, life: 0.5, color });
+  }
+}
+
+function update(dt, t) {
+  if (gameOver) return;
+  const left = keys['ArrowLeft'] || keys['a'], right = keys['ArrowRight'] || keys['d'];
+  player.moveDir = (right ? 1 : 0) - (left ? 1 : 0);
+  player.x += player.moveDir * player.speed * dt;
+  player.x = Math.max(0, Math.min(canvas.width - player.width, player.x));
+  player.bullets.forEach(b => { b.y += b.vy * dt; });
+  player.bullets = player.bullets.filter(b => b.y > -20);
+
+  // Enemy movement and positions
+  const aliveEnemies = enemies.filter(e => e.alive);
+  if (aliveEnemies.length > 0) {
+    aliveEnemies.forEach(e => { e.baseX += enemyDir * baseEnemySpeed * dt; });
+    let minX = Infinity, maxX = -Infinity, maxY = -Infinity;
+    aliveEnemies.forEach(e => {
+      const r = getEnemyRect(e, t);
+      e.x = r.x; e.y = r.y;
+      minX = Math.min(minX, r.x);
+      maxX = Math.max(maxX, r.x + e.width);
+      maxY = Math.max(maxY, r.y + e.height);
+    });
+    if (minX < 0 || maxX > canvas.width) {
+      enemyDir *= -1;
+      aliveEnemies.forEach(e => { e.baseY += enemyH / 2; });
+    }
+    if (maxY >= player.y && player.alive) { lives = 0; gameOver = true; }
+  }
+
+  // Enemy shooting
+  if (aliveEnemies.length > 0 && Math.random() < baseFireChance * (1 + (1 - aliveEnemies.length / enemies.length))) {
+    const shooters = bottomShooters(t);
+    if (shooters.length > 0) enemyBullets.push(aimBulletFrom(shooters[Math.floor(Math.random() * shooters.length)]));
+  }
+
+  // Enemy bullets
+  enemyBullets.forEach(b => { b.x += b.vx * dt; b.y += b.vy * dt; });
+  enemyBullets = enemyBullets.filter(b => b.y < canvas.height + 20);
+
+  // Collisions
+  player.bullets.forEach(b => {
+    enemies.forEach(e => {
+      if (e.alive && rectsOverlap(b, e)) {
+        e.alive = false;
+        score += 10;
+        b.y = -999;
+        spawnExplosion(e.x + e.width / 2, e.y + e.height / 2, '#f00');
+      }
+    });
+  });
+
+  if (player.alive) {
+    enemyBullets.forEach(b => {
+      if (rectsOverlap(b, player)) {
+        b.y = 9999;
+        lives--;
+        spawnExplosion(player.x + player.width / 2, player.y + player.height / 2, '#0ff');
+        if (lives <= 0) { player.alive = false; gameOver = true; }
+      }
+    });
+  }
+
+  // Explosions
+  explosions.forEach(p => { p.x += p.vx * dt; p.y += p.vy * dt; p.life -= dt; });
+  explosions = explosions.filter(p => p.life > 0);
+
+  // Wave complete
+  if (enemies.length > 0
