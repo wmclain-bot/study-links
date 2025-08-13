@@ -1,0 +1,449 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <title>Top-Down Racer</title>
+  <style>
+    :root {
+      --bg: #0e0f13;
+      --road: #555b66;
+      --grass: #12381f;
+      --wall: #e7e9ed;
+      --hud: #f5f7fa;
+      --accent: #4ff2c8;
+      --accent2: #ffcc66;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      background: radial-gradient(1200px 700px at 50% 50%, #111428, #0c0d12 60%);
+      color: var(--hud);
+      font-family: Inter, system-ui, -apple-system, Segoe UI, Roboto, Arial, sans-serif;
+      display: grid;
+      place-items: center;
+      height: 100vh;
+    }
+    .wrap {
+      display: grid;
+      gap: 12px;
+      justify-items: center;
+    }
+    h1 {
+      margin: 6px 0 0;
+      font-weight: 700;
+      letter-spacing: 0.5px;
+      font-size: 20px;
+      color: var(--accent);
+      text-shadow: 0 0 8px rgba(79,242,200,0.3);
+    }
+    canvas {
+      background: var(--bg);
+      border: 2px solid #2a2d36;
+      border-radius: 12px;
+      box-shadow: 0 20px 60px rgba(0,0,0,0.35);
+      display: block;
+    }
+    .hud {
+      display: flex;
+      gap: 18px;
+      align-items: center;
+      font-size: 14px;
+      background: rgba(20,22,27,0.6);
+      padding: 10px 14px;
+      border-radius: 10px;
+      border: 1px solid #2a2d36;
+      backdrop-filter: blur(6px);
+    }
+    .hud span strong { color: var(--accent2); }
+    .controls {
+      font-size: 12px;
+      opacity: 0.85;
+    }
+    .pill {
+      padding: 2px 8px;
+      border: 1px solid #2a2d36;
+      border-radius: 999px;
+      background: rgba(42,45,54,0.35);
+      font-variant-numeric: tabular-nums;
+    }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <h1>Top‑Down Racer</h1>
+    <canvas id="game" width="900" height="600"></canvas>
+    <div class="hud">
+      <span class="pill">Laps: <strong id="laps">0</strong></span>
+      <span class="pill">Lap: <strong id="lapTime">--.--</strong> s</span>
+      <span class="pill">Best: <strong id="bestTime">--.--</strong> s</span>
+      <span class="pill">Speed: <strong id="speed">0</strong> px/s</span>
+      <span class="controls">Arrows/WASD to drive • R to reset</span>
+    </div>
+  </div>
+
+  <script>
+    // Canvas setup
+    const canvas = document.getElementById('game');
+    const ctx = canvas.getContext('2d');
+    const W = canvas.width, H = canvas.height;
+    const CX = W / 2, CY = H / 2;
+
+    // Track geometry (ring)
+    const outerR = Math.min(W, H) * 0.42;
+    const trackWidth = 90;
+    const innerR = outerR - trackWidth;
+
+    // Start/finish + checkpoints (radial gates)
+    // Start: angle 0 (right side) => horizontal gate at y=CY, x ∈ [CX+innerR, CX+outerR]
+    const gates = {
+      start:   { type: 'h', y: CY, x1: CX + innerR, x2: CX + outerR, name: 'start' },
+      top:     { type: 'v', x: CX, y1: CY - outerR, y2: CY - innerR, name: 'top' },
+      left:    { type: 'h', y: CY, x1: CX - outerR, x2: CX - innerR, name: 'left' },
+      bottom:  { type: 'v', x: CX, y1: CY + innerR, y2: CY + outerR, name: 'bottom' },
+    };
+
+    // Input
+    const keys = { ArrowUp:false, ArrowDown:false, ArrowLeft:false, ArrowRight:false, w:false, a:false, s:false, d:false };
+
+    addEventListener('keydown', e => {
+      if (e.key.toLowerCase() in keys) keys[e.key.toLowerCase()] = true;
+      if (e.key in keys) keys[e.key] = true;
+      if (e.key.toLowerCase() === 'r') resetRace(true);
+    });
+    addEventListener('keyup', e => {
+      if (e.key.toLowerCase() in keys) keys[e.key.toLowerCase()] = false;
+      if (e.key in keys) keys[e.key] = false;
+    });
+
+    // Car
+    const car = {
+      x: CX + (innerR + trackWidth * 0.5), // place on start line center
+      y: CY,
+      angle: Math.PI / 2,   // facing downward (clockwise tangent at start)
+      speed: 0,
+      maxSpeedRoad: 420,
+      maxSpeedGrass: 200,
+      accel: 360,           // px/s^2
+      brake: 560,           // px/s^2
+      reverseAccel: 220,
+      frictionRoad: 0.98,   // per frame multiplier (60fps)
+      frictionGrass: 0.94,
+      turnRate: 2.4,        // rad/s at full stick
+      w: 36,
+      h: 18,
+      prevX: null,
+      prevY: null,
+    };
+
+    // Timing & laps
+    let lastTime = performance.now();
+    let lapStart = performance.now();
+    let lastLap = null;
+    let bestLap = null;
+    let laps = 0;
+    let cp = { top:false, left:false, bottom:false };
+    let startCooldown = 0; // ms to avoid double-trigger
+
+    // Utility
+    const clamp = (v, a, b) => Math.max(a, Math.min(b, v));
+    const dist2 = (x1,y1,x2,y2) => (x1-x2)*(x1-x2) + (y1-y2)*(y1-y2);
+    const onRoad = (x, y) => {
+      const r = Math.sqrt((x - CX) ** 2 + (y - CY) ** 2);
+      return r >= innerR && r <= outerR;
+    };
+
+    // Gate crossing detection (segment vs. axis-aligned segment)
+    function crossedGate(prevX, prevY, x, y, gate) {
+      if (gate.type === 'h') {
+        // Cross horizontal line y = gate.y, and x at intersection within [x1,x2]
+        const y1 = prevY - gate.y, y2 = y - gate.y;
+        if ((y1 === 0 && y2 === 0)) return false;
+        if ((y1 <= 0 && y2 >= 0) || (y1 >= 0 && y2 <= 0)) {
+          const t = (gate.y - prevY) / (y - prevY);
+          const xi = prevX + t * (x - prevX);
+          return xi >= Math.min(gate.x1, gate.x2) && xi <= Math.max(gate.x1, gate.x2);
+        }
+      } else {
+        // Vertical line x = gate.x, and y at intersection within [y1,y2]
+        const x1 = prevX - gate.x, x2 = x - gate.x;
+        if ((x1 === 0 && x2 === 0)) return false;
+        if ((x1 <= 0 && x2 >= 0) || (x1 >= 0 && x2 <= 0)) {
+          const t = (gate.x - prevX) / (x - prevX);
+          const yi = prevY + t * (y - prevY);
+          return yi >= Math.min(gate.y1, gate.y2) && yi <= Math.max(gate.y1, gate.y2);
+        }
+      }
+      return false;
+    }
+
+    function update(dt) {
+      // Save previous position for gate checks
+      car.prevX = car.x; car.prevY = car.y;
+
+      // Input state
+      const up = keys.ArrowUp || keys.w;
+      const down = keys.ArrowDown || keys.s;
+      const left = keys.ArrowLeft || keys.a;
+      const right = keys.ArrowRight || keys.d;
+
+      // Determine surface
+      const road = onRoad(car.x, car.y);
+
+      // Target max speed and friction based on surface
+      const maxV = road ? car.maxSpeedRoad : car.maxSpeedGrass;
+      const friction = road ? car.frictionRoad : car.frictionGrass;
+
+      // Acceleration and braking
+      if (up) {
+        car.speed += car.accel * dt;
+      } else if (down) {
+        if (car.speed > 0) {
+          car.speed -= car.brake * dt;
+        } else {
+          car.speed -= car.reverseAccel * dt;
+        }
+      } else {
+        // Coasting
+        car.speed *= Math.pow(friction, 60 * dt); // normalize to ~60fps
+      }
+
+      // Clamp speed
+      car.speed = clamp(car.speed, -maxV * 0.35, maxV);
+
+      // Steering: scale with speed (less steering at low speed)
+      const steerInput = (left ? -1 : 0) + (right ? 1 : 0);
+      const speedFactor = clamp(Math.abs(car.speed) / car.maxSpeedRoad, 0, 1);
+      car.angle += steerInput * car.turnRate * speedFactor * dt;
+
+      // Move
+      car.x += Math.cos(car.angle) * car.speed * dt;
+      car.y += Math.sin(car.angle) * car.speed * dt;
+
+      // Outer/inner boundary "soft walls": prevent leaving ring too far
+      const dx = car.x - CX, dy = car.y - CY;
+      const r = Math.sqrt(dx*dx + dy*dy);
+
+      // If off the track, add heavier drag
+      if (!road) {
+        car.speed *= Math.pow(0.94, 60 * dt);
+      }
+
+      const margin = 4;
+      if (r > outerR - margin) {
+        const nx = dx / r, ny = dy / r;
+        const targetR = outerR - margin;
+        car.x = CX + nx * targetR;
+        car.y = CY + ny * targetR;
+        car.speed *= 0.6;
+      }
+      if (r < innerR + margin) {
+        const nx = dx / (r || 1), ny = dy / (r || 1);
+        const targetR = innerR + margin;
+        car.x = CX + nx * targetR;
+        car.y = CY + ny * targetR;
+        car.speed *= 0.6;
+      }
+
+      // Gate handling
+      const now = performance.now();
+      const crossedTop    = crossedGate(car.prevX, car.prevY, car.x, car.y, gates.top);
+      const crossedLeft   = crossedGate(car.prevX, car.prevY, car.x, car.y, gates.left);
+      const crossedBottom = crossedGate(car.prevX, car.prevY, car.x, car.y, gates.bottom);
+      if (crossedTop) cp.top = true;
+      if (crossedLeft) cp.left = true;
+      if (crossedBottom) cp.bottom = true;
+
+      // Start/finish: only count when moving clockwise (positive Y velocity near start)
+      const crossedStart = crossedGate(car.prevX, car.prevY, car.x, car.y, gates.start);
+      const velY = Math.sin(car.angle) * car.speed;
+      const movingClockwiseAtStart = velY > 40; // threshold to avoid idling triggers
+
+      if (crossedStart && road && movingClockwiseAtStart && (now - startCooldown) > 600) {
+        // Require all checkpoints since last lap
+        if (cp.top && cp.left && cp.bottom) {
+          const lap = (now - lapStart) / 1000;
+          lastLap = lap;
+          bestLap = bestLap ? Math.min(bestLap, lap) : lap;
+          laps += 1;
+          lapStart = now;
+        }
+        // Reset checkpoints and cooldown
+        cp.top = cp.left = cp.bottom = false;
+        startCooldown = now;
+      }
+
+      // HUD
+      document.getElementById('speed').textContent = Math.round(Math.abs(car.speed));
+      document.getElementById('laps').textContent = laps;
+      document.getElementById('lapTime').textContent =
+        ((performance.now() - lapStart) / 1000).toFixed(2);
+      document.getElementById('bestTime').textContent =
+        bestLap ? bestLap.toFixed(2) : '--.--';
+    }
+
+    function drawTrack() {
+      // Grass
+      ctx.fillStyle = getComputedStyle(document.documentElement).getPropertyValue('--grass');
+      ctx.beginPath();
+      ctx.rect(0, 0, W, H);
+      ctx.fill();
+
+      // Road ring
+      ctx.fillStyle = getComputedStyle(document.documentElement).getPropertyValue('--road');
+      ctx.beginPath();
+      ctx.arc(CX, CY, outerR, 0, Math.PI * 2);
+      ctx.arc(CX, CY, innerR, 0, Math.PI * 2, true);
+      ctx.fill('evenodd');
+
+      // Outer and inner edges
+      ctx.strokeStyle = '#9aa3ad';
+      ctx.lineWidth = 4;
+      ctx.beginPath();
+      ctx.arc(CX, CY, outerR, 0, Math.PI * 2);
+      ctx.stroke();
+      ctx.beginPath();
+      ctx.arc(CX, CY, innerR, 0, Math.PI * 2);
+      ctx.stroke();
+
+      // Start/finish line (checkered)
+      const segs = 14;
+      const x1 = gates.start.x1, x2 = gates.start.x2, y0 = gates.start.y;
+      const len = x2 - x1;
+      const segW = len / segs;
+      for (let i = 0; i < segs; i++) {
+        ctx.fillStyle = (i % 2 === 0) ? '#ffffff' : '#111';
+        ctx.fillRect(x1 + i * segW, y0 - 8, segW, 16);
+      }
+
+      // Checkpoint markers (subtle)
+      ctx.strokeStyle = 'rgba(255,255,255,0.25)';
+      ctx.lineWidth = 3;
+      // Top (vertical at x=CX)
+      ctx.beginPath();
+      ctx.moveTo(gates.top.x, gates.top.y1);
+      ctx.lineTo(gates.top.x, gates.top.y2);
+      ctx.stroke();
+      // Left (horizontal at y=CY)
+      ctx.beginPath();
+      ctx.moveTo(gates.left.x1, gates.left.y);
+      ctx.lineTo(gates.left.x2, gates.left.y);
+      ctx.stroke();
+      // Bottom (vertical at x=CX)
+      ctx.beginPath();
+      ctx.moveTo(gates.bottom.x, gates.bottom.y1);
+      ctx.lineTo(gates.bottom.x, gates.bottom.y2);
+      ctx.stroke();
+
+      // Scenery: crowd dots
+      ctx.fillStyle = 'rgba(240,240,255,0.12)';
+      for (let i = 0; i < 120; i++) {
+        const rr = outerR + 20 + Math.random() * 60;
+        const ang = Math.random() * Math.PI * 2;
+        const x = CX + Math.cos(ang) * rr;
+        const y = CY + Math.sin(ang) * rr;
+        ctx.fillRect(x, y, 2, 2);
+      }
+    }
+
+    function drawCar() {
+      // Shadow
+      ctx.save();
+      ctx.translate(car.x + 6, car.y + 6);
+      ctx.rotate(car.angle);
+      ctx.fillStyle = 'rgba(0,0,0,0.35)';
+      roundRect(-car.w/2, -car.h/2, car.w, car.h, 6);
+      ctx.fill();
+      ctx.restore();
+
+      // Body
+      ctx.save();
+      ctx.translate(car.x, car.y);
+      ctx.rotate(car.angle);
+
+      // Body gradient
+      const grd = ctx.createLinearGradient(-car.w/2, 0, car.w/2, 0);
+      grd.addColorStop(0, '#0cf2a6');
+      grd.addColorStop(1, '#26a6ff');
+      ctx.fillStyle = grd;
+      roundRect(-car.w/2, -car.h/2, car.w, car.h, 6);
+      ctx.fill();
+
+      // Cockpit
+      ctx.fillStyle = '#111820';
+      roundRect(0, -car.h*0.35, car.w*0.35, car.h*0.7, 4);
+      ctx.fill();
+
+      // Wheels
+      ctx.fillStyle = '#1a1f27';
+      ctx.fillRect(-car.w/2 - 2, -car.h/2 + 2, 6, 5);
+      ctx.fillRect(-car.w/2 - 2,  car.h/2 - 7, 6, 5);
+      ctx.fillRect( car.w/2 - 4, -car.h/2 + 2, 6, 5);
+      ctx.fillRect( car.w/2 - 4,  car.h/2 - 7, 6, 5);
+
+      // Headlight glow when accelerating
+      if ((keys.ArrowUp || keys.w) && car.speed > 20) {
+        ctx.fillStyle = 'rgba(255,255,200,0.25)';
+        ctx.beginPath();
+        ctx.ellipse(car.w/2 + 6, 0, 20, 8, 0, 0, Math.PI*2);
+        ctx.fill();
+      }
+
+      ctx.restore();
+    }
+
+    function roundRect(x, y, w, h, r) {
+      const rr = Math.min(r, w/2, h/2);
+      ctx.beginPath();
+      ctx.moveTo(x + rr, y);
+      ctx.arcTo(x + w, y,     x + w, y + h, rr);
+      ctx.arcTo(x + w, y + h, x,     y + h, rr);
+      ctx.arcTo(x,     y + h, x,     y,     rr);
+      ctx.arcTo(x,     y,     x + w, y,     rr);
+      ctx.closePath();
+    }
+
+    function draw() {
+      drawTrack();
+      drawCar();
+      // HUD overlay marker for current lap delta vs. best
+      if (bestLap) {
+        const nowLap = (performance.now() - lapStart) / 1000;
+        const delta = nowLap - bestLap;
+        ctx.fillStyle = delta < 0 ? 'rgba(79,242,200,0.9)' : 'rgba(255,120,120,0.9)';
+        ctx.font = '12px ui-monospace, SFMono-Regular, Menlo, Consolas, monospace';
+        const text = (delta >= 0 ? '+' : '') + delta.toFixed(2) + 's';
+        ctx.fillText(text, 12, 18);
+      }
+    }
+
+    function loop(ts) {
+      const dt = (ts - lastTime) / 1000;
+      lastTime = ts;
+      update(dt);
+      draw();
+      requestAnimationFrame(loop);
+    }
+
+    function resetRace(hard=false) {
+      car.x = CX + (innerR + trackWidth * 0.5);
+      car.y = CY;
+      car.angle = Math.PI / 2;
+      car.speed = 0;
+      cp.top = cp.left = cp.bottom = false;
+      lapStart = performance.now();
+      startCooldown = performance.now();
+      if (hard) {
+        laps = 0; lastLap = null; bestLap = null;
+        document.getElementById('laps').textContent = '0';
+        document.getElementById('lapTime').textContent = '--.--';
+        document.getElementById('bestTime').textContent = '--.--';
+        document.getElementById('speed').textContent = '0';
+      }
+    }
+
+    // Kickoff
+    resetRace();
+    requestAnimationFrame(ts => { lastTime = ts; requestAnimationFrame(loop); });
+  </script>
+</body>
+</html>
