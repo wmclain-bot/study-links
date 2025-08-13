@@ -1,0 +1,553 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<title>Space Invaders — Boss Finale (Wave 5)</title>
+<style>
+  body { margin:0; background:#000; color:#0f0; font-family:monospace; display:flex; flex-direction:column; align-items:center; }
+  canvas { background:#111; border:2px solid #0f0; margin-top:20px; }
+  h1 { margin:16px 0 0; font-size:22px; }
+</style>
+</head>
+<body>
+<h1>👾 Space Invaders — 3 Lives, Explosions, Boss Finale</h1>
+<canvas id="game" width="800" height="600"></canvas>
+
+<script>
+  const canvas = document.getElementById('game');
+  const ctx = canvas.getContext('2d');
+
+  // Game settings
+  const MAX_WAVE = 5;
+  const E_W = 40, E_H = 22, SP_X = 16, SP_Y = 16;
+  const DESCEND_STEP = E_H / 2;
+  const PLAYER_BULLET_SPEED = 420;
+
+  // Player
+  const player = {
+    x: canvas.width / 2 - 20,
+    y: canvas.height - 50,
+    width: 40,
+    height: 20,
+    speed: 260,       // px/s
+    moveDir: 0,       // -1, 0, 1
+    bullets: [],
+    shootCd: 0,       // seconds
+    lives: 3,
+    alive: true,
+    invuln: 0         // seconds after hit
+  };
+
+  // State
+  let enemies = [];
+  let enemyBullets = [];
+  let explosions = [];
+  let boss = null;
+
+  let score = 0;
+  let wave = 1;
+  let gameOver = false;
+  let won = false;
+  let waveLabelTimer = 0; // seconds
+  let lastT = performance.now();
+  let enemyDir = 1;
+
+  // Difficulty (gentle scaling so Wave 3 isn't brutal)
+  let enemySpeed = 70;             // px/s
+  let enemyBulletSpeed = 180;      // px/s
+  let fireChancePerFrame = 0.008;  // baseline per ~60fps frame
+  let sineAmp = 10;                // px
+  let sineSpd = 2.0;               // rad/s
+
+  // Input
+  const keys = Object.create(null);
+  document.addEventListener('keydown', (e) => {
+    keys[e.code] = true;
+    if (['ArrowLeft','ArrowRight','Space'].includes(e.code)) e.preventDefault();
+    if (e.code === 'Enter' && (gameOver || won)) resetGame();
+  }, { passive:false });
+  document.addEventListener('keyup', (e) => {
+    keys[e.code] = false;
+    if (['ArrowLeft','ArrowRight','Space'].includes(e.code)) e.preventDefault();
+  }, { passive:false });
+
+  // Wave config for waves 1–4
+  function getWaveConfig(w) {
+    return {
+      rows: Math.min(5 + Math.floor((w - 1) / 2), 8),
+      cols: 10,
+      speed: 70 + 16 * (w - 1),
+      bulletSpeed: 180 + 12 * (w - 1),
+      fireChance: 0.008 + 0.0018 * (w - 1),
+      sineAmp: Math.min(10 + 1.2 * (w - 1), 20),
+      sineSpd: 2.0 + 0.12 * (w - 1)
+    };
+  }
+
+  function spawnWave() {
+    enemies = [];
+    enemyBullets = [];
+    boss = null;
+    enemyDir = 1;
+
+    if (wave === MAX_WAVE) {
+      // Boss wave
+      boss = {
+        x: canvas.width / 2 - 120,
+        y: 80,
+        width: 240,
+        height: 80,
+        hp: 150,
+        maxHp: 150,
+        baseSpeed: 90,
+        phaseTwo: false,
+        // Attack timers
+        shootTimer: 0.6,   // aimed shot
+        spreadTimer: 2.4,  // spread volley
+        rainTimer: 2.8     // bullet rain
+      };
+      enemyBulletSpeed = 220; // boss bullet baseline
+    } else {
+      // Normal enemy waves
+      const cfg = getWaveConfig(wave);
+      enemySpeed = cfg.speed;
+      enemyBulletSpeed = cfg.bulletSpeed;
+      fireChancePerFrame = cfg.fireChance;
+      sineAmp = cfg.sineAmp;
+      sineSpd = cfg.sineSpd;
+
+      const totalWidth = cfg.cols * E_W + (cfg.cols - 1) * SP_X;
+      const startX = (canvas.width - totalWidth) / 2;
+      const startY = 60;
+
+      for (let r = 0; r < cfg.rows; r++) {
+        for (let c = 0; c < cfg.cols; c++) {
+          enemies.push({
+            row: r, col: c,
+            baseX: startX + c * (E_W + SP_X),
+            baseY: startY + r * (E_H + SP_Y),
+            width: E_W, height: E_H,
+            alive: true,
+            phase: Math.random() * Math.PI * 2,
+            x: 0, y: 0
+          });
+        }
+      }
+    }
+
+    waveLabelTimer = 1.5;
+  }
+
+  function resetGame() {
+    score = 0;
+    wave = 1;
+    gameOver = false;
+    won = false;
+    player.x = canvas.width / 2 - player.width / 2;
+    player.bullets = [];
+    player.lives = 3;
+    player.alive = true;
+    player.invuln = 0;
+    explosions = [];
+    spawnWave();
+  }
+
+  // Math helpers
+  function rectsOverlap(a, b) {
+    return a.x < b.x + b.width &&
+           a.x + a.width > b.x &&
+           a.y < b.y + b.height &&
+           a.y + a.height > b.y;
+  }
+
+  function getEnemyRect(e, tSec) {
+    const wobble = sineAmp * Math.sin(tSec * sineSpd + e.phase);
+    return { x: e.baseX + wobble, y: e.baseY, width: e.width, height: e.height };
+  }
+
+  function bottomShooters(tSec) {
+    const byCol = new Map();
+    for (const e of enemies) {
+      if (!e.alive) continue;
+      const r = getEnemyRect(e, tSec);
+      if (!byCol.has(e.col) || r.y > byCol.get(e.col).y) byCol.set(e.col, r);
+    }
+    return Array.from(byCol.values());
+  }
+
+  function aimBulletFrom(shooterRect) {
+    const sCx = shooterRect.x + shooterRect.width / 2;
+    const sCy = shooterRect.y + shooterRect.height;
+    const pCx = player.x + player.width / 2;
+    const pCy = player.y;
+
+    const dy = Math.max(10, pCy - sCy);
+    const timeToReach = dy / enemyBulletSpeed;
+    const predictedX = pCx + player.moveDir * player.speed * timeToReach * 0.75;
+
+    const dx = predictedX - sCx;
+    const len = Math.hypot(dx, dy) || 1;
+    return {
+      x: sCx - 2, y: sCy,
+      width: 4, height: 10,
+      vx: (dx / len) * enemyBulletSpeed,
+      vy: (dy / len) * enemyBulletSpeed
+    };
+  }
+
+  function spawnExplosion(x, y, color = '#ff0') {
+    for (let i = 0; i < 16; i++) {
+      const ang = Math.random() * Math.PI * 2;
+      const spd = 80 + Math.random() * 140;
+      explosions.push({
+        x, y,
+        vx: Math.cos(ang) * spd,
+        vy: Math.sin(ang) * spd,
+        life: 0.5 + Math.random() * 0.25, // seconds
+        maxLife: 0.75,
+        size: 2 + Math.random() * 2,
+        color
+      });
+    }
+  }
+
+  // Boss attacks
+  function bossAimedShot() {
+    const sCx = boss.x + boss.width / 2;
+    const sCy = boss.y + boss.height;
+    const pCx = player.x + player.width / 2;
+    const pCy = player.y;
+    const dx = pCx - sCx;
+    const dy = pCy - sCy;
+    const len = Math.hypot(dx, dy) || 1;
+    const spd = boss.phaseTwo ? enemyBulletSpeed * 1.2 : enemyBulletSpeed;
+    enemyBullets.push({
+      x: sCx - 2, y: sCy,
+      width: 4, height: 10,
+      vx: (dx / len) * spd,
+      vy: (dy / len) * spd
+    });
+  }
+
+  function bossSpreadVolley(n = 5, cone = 0.5) {
+    const originX = boss.x + boss.width / 2 - 2;
+    const originY = boss.y + boss.height;
+    const centerAngle = Math.PI / 2; // downward
+    const spd = boss.phaseTwo ? enemyBulletSpeed * 1.15 : enemyBulletSpeed;
+    for (let i = 0; i < n; i++) {
+      const t = n === 1 ? 0 : (i / (n - 1)) - 0.5; // -0.5..0.5
+      const ang = centerAngle + t * cone;
+      enemyBullets.push({
+        x: originX, y: originY,
+        width: 4, height: 10,
+        vx: Math.cos(ang) * spd * 0.6, // slight outward drift
+        vy: Math.sin(ang) * spd
+      });
+    }
+  }
+
+  function bossRain(count = 6) {
+    const spd = boss.phaseTwo ? enemyBulletSpeed * 1.05 : enemyBulletSpeed;
+    for (let i = 0; i < count; i++) {
+      const rx = 20 + Math.random() * (canvas.width - 40);
+      enemyBullets.push({
+        x: rx, y: boss.y + boss.height,
+        width: 4, height: 10,
+        vx: 0, vy: spd
+      });
+    }
+  }
+
+  function update(dt, tSec) {
+    if (gameOver || won) return;
+
+    // Cooldowns
+    if (player.shootCd > 0) player.shootCd -= dt;
+    if (player.invuln > 0) player.invuln -= dt;
+
+    // Player movement
+    const left = !!(keys['ArrowLeft'] || keys['KeyA']);
+    const right = !!(keys['ArrowRight'] || keys['KeyD']);
+    player.moveDir = (right ? 1 : 0) - (left ? 1 : 0);
+    player.x += player.moveDir * player.speed * dt;
+    player.x = Math.max(0, Math.min(canvas.width - player.width, player.x));
+
+    // Shooting (hold Space)
+    if (player.alive && keys['Space'] && player.shootCd <= 0) {
+      player.bullets.push({
+        x: player.x + player.width / 2 - 2,
+        y: player.y,
+        width: 4, height: 10,
+        vx: 0, vy: -PLAYER_BULLET_SPEED
+      });
+      player.shootCd = 0.18;
+    }
+
+    // Player bullets
+    for (const b of player.bullets) { b.x += b.vx * dt; b.y += b.vy * dt; }
+    player.bullets = player.bullets.filter(b => b.y + b.height > 0);
+
+    // Boss logic
+    if (boss) {
+      // Movement: gentle horizontal oscillation
+      boss.x += Math.sin(tSec) * boss.baseSpeed * dt;
+      boss.x = Math.max(10, Math.min(canvas.width - boss.width - 10, boss.x)); // keep on screen
+
+      // Phase transition
+      if (!boss.phaseTwo && boss.hp <= boss.maxHp / 2) {
+        boss.phaseTwo = true;
+        boss.baseSpeed *= 1.25;
+      }
+
+      // Timed attacks
+      boss.shootTimer -= dt;
+      boss.spreadTimer -= dt;
+      boss.rainTimer -= dt;
+
+      if (boss.shootTimer <= 0) {
+        bossAimedShot();
+        boss.shootTimer = boss.phaseTwo ? 0.45 : 0.65;
+      }
+      if (boss.spreadTimer <= 0) {
+        bossSpreadVolley(boss.phaseTwo ? 7 : 5, boss.phaseTwo ? 0.7 : 0.5);
+        boss.spreadTimer = boss.phaseTwo ? 1.8 : 2.3;
+      }
+      if (boss.rainTimer <= 0) {
+        bossRain(boss.phaseTwo ? 8 : 6);
+        boss.rainTimer = boss.phaseTwo ? 2.1 : 2.7;
+      }
+
+      // Player bullets vs boss
+      for (const b of player.bullets) {
+        const r = { x: boss.x, y: boss.y, width: boss.width, height: boss.height };
+        if (rectsOverlap(b, r)) {
+          boss.hp -= 1;
+          b.y = -9999;
+          spawnExplosion(b.x, b.y, '#f55');
+          if (boss.hp <= 0) {
+            spawnExplosion(boss.x + boss.width / 2, boss.y + boss.height / 2, '#0ff');
+            score += 500;
+            won = true;
+            gameOver = true;
+          }
+        }
+      }
+    } else {
+      // Normal enemy wave logic
+      const alive = enemies.filter(e => e.alive);
+      if (alive.length > 0) {
+        // Horizontal movement
+        for (const e of alive) e.baseX += enemyDir * enemySpeed * dt;
+
+        // Recompute positions and bounds
+        let minX = Infinity, maxX = -Infinity, maxY = -Infinity;
+        for (const e of alive) {
+          const r = getEnemyRect(e, tSec);
+          e.x = r.x; e.y = r.y;
+          if (r.x < minX) minX = r.x;
+          if (r.x + r.width > maxX) maxX = r.x + r.width;
+          if (r.y + r.height > maxY) maxY = r.y + r.height;
+        }
+
+        // Bounce and descend
+        if (minX < 0 || maxX > canvas.width) {
+          enemyDir *= -1;
+          for (const e of alive) e.baseY += DESCEND_STEP;
+        }
+
+        // Lose if they reach player row
+        if (maxY >= player.y && player.alive) {
+          player.lives = 0;
+          player.alive = false;
+          gameOver = true;
+        }
+
+        // Enemy shooting (bottom-most per column, weighted toward player)
+        const frames = dt * 60;
+        const aliveRatio = alive.length / enemies.length;
+        const chance = fireChancePerFrame * (1 + (1 - aliveRatio) * 1.6);
+        if (Math.random() < chance * frames) {
+          const shooters = bottomShooters(tSec);
+          if (shooters.length) {
+            const pCx = player.x + player.width / 2;
+            let total = 0, weights = [];
+            for (const s of shooters) {
+              const sCx = s.x + s.width / 2;
+              const w = 1 / (1 + Math.abs(pCx - sCx));
+              weights.push(w); total += w;
+            }
+            let r = Math.random() * total, pick = shooters[0];
+            for (let i = 0; i < shooters.length; i++) { r -= weights[i]; if (r <= 0) { pick = shooters[i]; break; } }
+            enemyBullets.push(aimBulletFrom(pick));
+          }
+        }
+      }
+
+      // Player bullets vs enemies
+      for (const b of player.bullets) {
+        for (const e of enemies) {
+          if (!e.alive) continue;
+          const r = { x: e.x, y: e.y, width: e.width, height: e.height };
+          if (rectsOverlap(b, r)) {
+            e.alive = false;
+            score += 10;
+            b.y = -9999;
+            spawnExplosion(e.x + e.width / 2, e.y + e.height / 2, '#f55');
+          }
+        }
+      }
+
+      // Wave complete -> next wave or boss
+      if (enemies.length > 0 && enemies.every(e => !e.alive)) {
+        wave += 1;
+        spawnWave();
+      }
+    }
+
+    // Enemy bullets motion
+    for (const b of enemyBullets) { b.x += b.vx * dt; b.y += b.vy * dt; }
+    enemyBullets = enemyBullets.filter(b => b.y < canvas.height + 40 && b.x + b.width > -40 && b.x < canvas.width + 40);
+
+    // Enemy bullets vs player
+    if (player.alive && player.invuln <= 0) {
+      for (const b of enemyBullets) {
+        if (rectsOverlap(b, player)) {
+          b.y = 9999; // remove bullet
+          player.lives -= 1;
+          player.invuln = 1.0; // 1s invulnerability
+          spawnExplosion(player.x + player.width / 2, player.y + player.height / 2, '#0ff');
+          if (player.lives <= 0) {
+            player.alive = false;
+            gameOver = true;
+          }
+          break;
+        }
+      }
+    }
+
+    // Explosions update
+    for (const p of explosions) { p.x += p.vx * dt; p.y += p.vy * dt; p.life -= dt; }
+    explosions = explosions.filter(p => p.life > 0);
+
+    // Wave label
+    if (waveLabelTimer > 0) waveLabelTimer -= dt;
+  }
+
+  function drawBossHP() {
+    const barW = 300, barH = 12;
+    const x = canvas.width / 2 - barW / 2;
+    const y = 60 - 20;
+    // Background
+    ctx.fillStyle = '#033';
+    ctx.fillRect(x, y, barW, barH);
+    // Foreground
+    const ratio = Math.max(0, boss.hp / boss.maxHp);
+    ctx.fillStyle = '#0ff';
+    ctx.fillRect(x, y, barW * ratio, barH);
+    // Border
+    ctx.strokeStyle = '#0f0';
+    ctx.strokeRect(x, y, barW, barH);
+  }
+
+  function draw(tSec) {
+    ctx.clearRect(0, 0, canvas.width, canvas.height);
+
+    // Player
+    if (player.alive) {
+      ctx.fillStyle = player.invuln > 0 ? (Math.floor(tSec * 20) % 2 ? '#0f0' : '#060') : '#0f0';
+      ctx.fillRect(player.x, player.y, player.width, player.height);
+    }
+
+    // Player bullets
+    ctx.fillStyle = '#fff';
+    for (const b of player.bullets) ctx.fillRect(b.x, b.y, b.width, b.height);
+
+    // Enemies or boss
+    if (boss) {
+      ctx.fillStyle = '#08f';
+      ctx.fillRect(boss.x, boss.y, boss.width, boss.height);
+      drawBossHP();
+    } else {
+      ctx.fillStyle = '#f00';
+      for (const e of enemies) {
+        if (!e.alive) continue;
+        ctx.fillRect(e.x, e.y, e.width, e.height);
+      }
+    }
+
+    // Enemy bullets
+    ctx.fillStyle = '#ff0';
+    for (const b of enemyBullets) ctx.fillRect(b.x, b.y, b.width, b.height);
+
+    // Explosions (additive blend)
+    ctx.save();
+    ctx.globalCompositeOperation = 'lighter';
+    for (const p of explosions) {
+      const a = Math.max(0, p.life / p.maxLife);
+      ctx.globalAlpha = a;
+      ctx.fillStyle = p.color;
+      ctx.beginPath();
+      ctx.arc(p.x, p.y, p.size, 0, Math.PI * 2);
+      ctx.fill();
+    }
+    ctx.restore();
+    ctx.globalAlpha = 1;
+
+    // HUD
+    ctx.fillStyle = '#0f0';
+    ctx.font = '16px monospace';
+    ctx.fillText(`Score: ${score}`, 10, 22);
+    ctx.fillText(`Wave: ${wave}/${MAX_WAVE}`, 10, 42);
+
+    // Lives
+    const iconW = 14, iconH = 8, gap = 6, x0 = canvas.width - 10 - (iconW * 3 + gap * 2), y0 = 14;
+    for (let i = 0; i < 3; i++) {
+      ctx.fillStyle = i < player.lives ? '#0f0' : '#033';
+      ctx.fillRect(x0 + i * (iconW + gap), y0, iconW, iconH);
+    }
+
+    // Wave label
+    if (waveLabelTimer > 0) {
+      ctx.fillStyle = '#0f0';
+      ctx.font = '24px monospace';
+      const text = wave === MAX_WAVE ? `Wave ${wave} — Boss` : `Wave ${wave}`;
+      const w = ctx.measureText(text).width;
+      ctx.fillText(text, canvas.width / 2 - w / 2, 44);
+    }
+
+    // End screens
+    if (gameOver || won) {
+      ctx.fillStyle = won ? '#0ff' : '#ff0';
+      ctx.font = '32px monospace';
+      const text = won ? 'YOU WIN — Press Enter' : 'GAME OVER — Press Enter';
+      const w = ctx.measureText(text).width;
+      ctx.fillText(text, canvas.width / 2 - w / 2, canvas.height / 2);
+    }
+  }
+
+  function loop(tNow) {
+    const dt = Math.min(0.033, (tNow - lastT) / 1000); // clamp big jumps
+    lastT = tNow;
+    const tSec = tNow / 1000;
+
+    // Update positions for enemies each frame (needed before drawing)
+    if (!boss) {
+      for (const e of enemies) {
+        if (!e.alive) continue;
+        const r = getEnemyRect(e, tSec);
+        e.x = r.x; e.y = r.y;
+      }
+    }
+
+    update(dt, tSec);
+    draw(tSec);
+
+    requestAnimationFrame(loop);
+  }
+
+  // Start
+  spawnWave();
+  requestAnimationFrame(loop);
+</script>
+</body>
+</html>
