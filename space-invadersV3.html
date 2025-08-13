@@ -1,0 +1,405 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <title>Space Invaders — Waves + Smart AI</title>
+  <style>
+    body {
+      margin: 0;
+      background: #000;
+      color: #0f0;
+      font-family: monospace;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+    }
+    canvas {
+      border: 2px solid #0f0;
+      margin-top: 20px;
+      background: #111;
+    }
+    h1 { margin-top: 20px; font-size: 24px; }
+  </style>
+</head>
+<body>
+  <h1>👾 Space Invaders — Waves + Smart AI</h1>
+  <canvas id="game" width="800" height="600"></canvas>
+
+  <script>
+    const canvas = document.getElementById("game");
+    const ctx = canvas.getContext("2d");
+
+    // Player
+    const player = {
+      x: canvas.width / 2 - 20,
+      y: canvas.height - 50,
+      width: 40,
+      height: 20,
+      speed: 260, // px/s
+      bullets: [],
+      alive: true,
+      moveDir: 0 // -1 left, 1 right, 0 idle
+    };
+
+    // Game state
+    let enemies = [];
+    let enemyBullets = [];
+    let score = 0;
+    let wave = 1;
+    let gameOver = false;
+    let messageTimer = 0; // frames for "Wave X"
+    let lastT = performance.now();
+
+    // Enemy layout constants
+    const enemyWidth = 40;
+    const enemyHeight = 22;
+    const enemySpacingX = 16;
+    const enemySpacingY = 16;
+
+    // Motion and difficulty (px/s, chance/frame approximated per dt)
+    let baseEnemySpeed = 80;        // updated per wave
+    let baseEnemyBulletSpeed = 220; // updated per wave
+    let baseFireChance = 0.010;     // baseline probability per 60 fps frame
+    let descendStep = enemyHeight / 2;
+
+    // Sine motion
+    let sineAmplitude = 10;
+    let sineSpeed = 2.0; // radians per second
+
+    // Formation direction
+    let enemyDirection = 1; // 1 right, -1 left
+
+    // Player bullet speed
+    const playerBulletSpeed = 420; // px/s
+
+    // Input
+    const keys = {};
+    document.addEventListener("keydown", e => {
+      keys[e.key] = true;
+      if (["ArrowLeft", "ArrowRight", " "].includes(e.key)) e.preventDefault();
+
+      if (e.key === " " && player.alive && !gameOver) {
+        player.bullets.push({
+          x: player.x + player.width / 2 - 2,
+          y: player.y,
+          width: 4,
+          height: 10,
+          vx: 0,
+          vy: -playerBulletSpeed
+        });
+      }
+
+      if (e.key === "Enter" && gameOver) {
+        // Restart
+        score = 0;
+        wave = 1;
+        player.alive = true;
+        player.x = canvas.width / 2 - player.width / 2;
+        gameOver = false;
+        spawnWave();
+      }
+    }, { passive: false });
+
+    document.addEventListener("keyup", e => {
+      keys[e.key] = false;
+      if (["ArrowLeft", "ArrowRight", " "].includes(e.key)) e.preventDefault();
+    }, { passive: false });
+
+    function getWaveConfig(w) {
+      return {
+        rows: Math.min(5 + Math.floor((w - 1) / 2), 8),
+        cols: 10,
+        speed: 80 + 26 * (w - 1),          // px/s
+        bulletSpeed: 220 + 18 * (w - 1),   // px/s
+        fireChance: 0.010 + 0.003 * (w - 1), // per ~60fps frame
+        sineAmp: Math.min(10 + 2 * (w - 1), 28),
+        sineSpd: 2.0 + 0.25 * (w - 1)      // rad/s
+      };
+    }
+
+    function spawnWave() {
+      const cfg = getWaveConfig(wave);
+      baseEnemySpeed = cfg.speed;
+      baseEnemyBulletSpeed = cfg.bulletSpeed;
+      baseFireChance = cfg.fireChance;
+      sineAmplitude = cfg.sineAmp;
+      sineSpeed = cfg.sineSpd;
+
+      enemies = [];
+      enemyBullets = [];
+      enemyDirection = 1;
+
+      const totalWidth = cfg.cols * enemyWidth + (cfg.cols - 1) * enemySpacingX;
+      const startX = Math.floor((canvas.width - totalWidth) / 2);
+      const startY = 60;
+
+      for (let row = 0; row < cfg.rows; row++) {
+        for (let col = 0; col < cfg.cols; col++) {
+          enemies.push({
+            row, col,
+            baseX: startX + col * (enemyWidth + enemySpacingX),
+            baseY: startY + row * (enemyHeight + enemySpacingY),
+            x: 0, y: 0, // visual positions computed each frame
+            width: enemyWidth,
+            height: enemyHeight,
+            alive: true,
+            phase: Math.random() * Math.PI * 2
+          });
+        }
+      }
+
+      messageTimer = 120; // ~2 seconds at 60fps
+    }
+
+    function getEnemyRect(e, t) {
+      // t in seconds
+      const wobble = sineAmplitude * Math.sin(t * sineSpeed + e.phase);
+      return {
+        x: e.baseX + wobble,
+        y: e.baseY,
+        width: e.width,
+        height: e.height
+      };
+    }
+
+    function rectsOverlap(a, b) {
+      return (
+        a.x < b.x + b.width &&
+        a.x + a.width > b.x &&
+        a.y < b.y + b.height &&
+        a.y + a.height > b.y
+      );
+    }
+
+    function bottomShooters(tSec) {
+      // Map lowest alive enemy by column using visual Y
+      const byCol = new Map();
+      for (const e of enemies) {
+        if (!e.alive) continue;
+        const r = getEnemyRect(e, tSec);
+        const current = byCol.get(e.col);
+        if (!current || r.y > current.r.y) {
+          byCol.set(e.col, { e, r });
+        }
+      }
+      return Array.from(byCol.values());
+    }
+
+    function aimBulletFrom(shooterRect, dtSec) {
+      // Predict player's future x based on current movement
+      const sCx = shooterRect.x + shooterRect.width / 2;
+      const sCy = shooterRect.y + shooterRect.height;
+
+      const pCx = player.x + player.width / 2;
+      const pCy = player.y;
+
+      const dy = Math.max(10, pCy - sCy);
+      const timeToReach = dy / baseEnemyBulletSpeed;
+
+      const leadFactor = 0.8; // tweak for challenge
+      const predictedX = pCx + player.moveDir * player.speed * timeToReach * leadFactor;
+
+      let dx = predictedX - sCx;
+      let len = Math.hypot(dx, dy);
+      if (len < 1e-3) len = 1;
+
+      const vx = (dx / len) * baseEnemyBulletSpeed;
+      const vy = (dy / len) * baseEnemyBulletSpeed;
+
+      return { x: sCx - 2, y: sCy, width: 4, height: 10, vx, vy };
+    }
+
+    function update(dtSec, tSec) {
+      if (gameOver) return;
+
+      // Player movement
+      const left = !!(keys["ArrowLeft"] || keys["a"]);
+      const right = !!(keys["ArrowRight"] || keys["d"]);
+      player.moveDir = (right ? 1 : 0) - (left ? 1 : 0);
+      player.x += player.moveDir * player.speed * dtSec;
+      player.x = Math.max(0, Math.min(canvas.width - player.width, player.x));
+
+      // Player bullets
+      for (const b of player.bullets) {
+        b.x += b.vx * dtSec;
+        b.y += b.vy * dtSec;
+      }
+      player.bullets = player.bullets.filter(b => b.y + b.height > 0);
+
+      // Compute visual rects for enemies and move formation horizontally
+      // Update baseX by direction; check for wall collision using visual bounds
+      const alive = enemies.filter(e => e.alive);
+      if (alive.length > 0) {
+        // Move horizontally
+        for (const e of alive) {
+          e.baseX += enemyDirection * baseEnemySpeed * dtSec;
+        }
+
+        // Check edges using current visual positions
+        let minX = Infinity, maxX = -Infinity, maxY = -Infinity;
+        for (const e of alive) {
+          const r = getEnemyRect(e, tSec);
+          if (r.x < minX) minX = r.x;
+          if (r.x + r.width > maxX) maxX = r.x + r.width;
+          if (r.y + r.height > maxY) maxY = r.y + r.height;
+          // cache for draw/collisions
+          e.x = r.x; e.y = r.y;
+        }
+
+        let hitWall = (minX < 0) || (maxX > canvas.width);
+        if (hitWall) {
+          enemyDirection *= -1;
+          for (const e of alive) {
+            e.baseY += descendStep;
+          }
+        }
+
+        // Lose if any enemy reaches the player's row
+        if (maxY >= player.y && player.alive) {
+          player.alive = false;
+          gameOver = true;
+        }
+      }
+
+      // Enemy shooting: only bottom-most per column, bias toward player column
+      if (alive.length > 0) {
+        // Convert per-frame chance (~60fps) to per-dt chance
+        const frames = dtSec * 60;
+        // Scale fire chance up as enemies die (classic pressure)
+        const aliveRatio = alive.length / enemies.length;
+        const scaledChance = baseFireChance * (1 + (1 - aliveRatio) * 1.8);
+        if (Math.random() < scaledChance * frames) {
+          const shooters = bottomShooters(tSec);
+          if (shooters.length > 0) {
+            // Weighted pick by horizontal closeness to player
+            const pCx = player.x + player.width / 2;
+            let weights = [];
+            let total = 0;
+            for (const s of shooters) {
+              const sCx = s.r.x + s.r.width / 2;
+              const dist = Math.abs(pCx - sCx);
+              const w = 1 / (1 + dist); // closer => higher weight
+              weights.push(w);
+              total += w;
+            }
+            let r = Math.random() * total;
+            let chosen = shooters[0];
+            for (let i = 0; i < shooters.length; i++) {
+              r -= weights[i];
+              if (r <= 0) { chosen = shooters[i]; break; }
+            }
+            enemyBullets.push(aimBulletFrom(chosen.r, dtSec));
+          }
+        }
+      }
+
+      // Enemy bullets
+      for (const b of enemyBullets) {
+        b.x += b.vx * dtSec;
+        b.y += b.vy * dtSec;
+      }
+      enemyBullets = enemyBullets.filter(b => b.y < canvas.height + 20 && b.x + b.width > -20 && b.x < canvas.width + 20);
+
+      // Collisions: player bullets vs enemies
+      for (const b of player.bullets) {
+        for (const e of enemies) {
+          if (!e.alive) continue;
+          const r = { x: e.x, y: e.y, width: e.width, height: e.height };
+          if (rectsOverlap(b, r)) {
+            e.alive = false;
+            b.y = -9999; // remove bullet
+            score += 10;
+          }
+        }
+      }
+      player.bullets = player.bullets.filter(b => b.y > -50);
+
+      // Collisions: enemy bullets vs player
+      if (player.alive) {
+        for (const b of enemyBullets) {
+          if (rectsOverlap(b, player)) {
+            player.alive = false;
+            gameOver = true;
+            break;
+          }
+        }
+      }
+
+      // Wave complete
+      if (enemies.length > 0 && enemies.every(e => !e.alive)) {
+        wave += 1;
+        spawnWave();
+      }
+    }
+
+    function draw(tSec) {
+      ctx.clearRect(0, 0, canvas.width, canvas.height);
+
+      // Player
+      if (player.alive) {
+        ctx.fillStyle = "#0f0";
+        ctx.fillRect(player.x, player.y, player.width, player.height);
+      }
+
+      // Player bullets
+      ctx.fillStyle = "#fff";
+      for (const b of player.bullets) {
+        ctx.fillRect(b.x, b.y, b.width, b.height);
+      }
+
+      // Enemies
+      ctx.fillStyle = "#f00";
+      for (const e of enemies) {
+        if (!e.alive) continue;
+        ctx.fillRect(e.x, e.y, e.width, e.height);
+      }
+
+      // Enemy bullets
+      ctx.fillStyle = "#ff0";
+      for (const b of enemyBullets) {
+        ctx.fillRect(b.x, b.y, b.width, b.height);
+      }
+
+      // HUD
+      ctx.fillStyle = "#0f0";
+      ctx.font = "16px monospace";
+      ctx.fillText(`Score: ${score}`, 10, 22);
+      ctx.fillText(`Wave: ${wave}`, 10, 42);
+
+      if (messageTimer > 0) {
+        ctx.fillStyle = "#0f0";
+        ctx.font = "24px monospace";
+        const text = `Wave ${wave}`;
+        const w = ctx.measureText(text).width;
+        ctx.fillText(text, canvas.width / 2 - w / 2, 40);
+      }
+
+      if (gameOver) {
+        ctx.fillStyle = "#ff0";
+        ctx.font = "32px monospace";
+        const text = "GAME OVER — Press Enter";
+        const w = ctx.measureText(text).width;
+        ctx.fillText(text, canvas.width / 2 - w / 2, canvas.height / 2);
+      }
+    }
+
+    function loop(tNow) {
+      const dtSec = Math.min(0.033, (tNow - lastT) / 1000); // clamp to avoid big jumps
+      lastT = tNow;
+
+      const tSec = tNow / 1000;
+
+      if (messageTimer > 0) messageTimer--;
+
+      update(dtSec, tSec);
+      draw(tSec);
+
+      requestAnimationFrame(loop);
+    }
+
+    // Start the game: spawn first wave and loop
+    spawnWave();
+    requestAnimationFrame(loop);
+  </script>
+</body>
+</html>
