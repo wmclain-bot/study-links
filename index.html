@@ -1,0 +1,49 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <title>Magic 8-Ball</title>
+  <style>
+    body {
+      font-family: 'Courier New', monospace;
+      background-color: #1e1e1e;
+      color: #00ffcc;
+      text-align: center;
+      padding-top: 100px;
+    }
+    input, button {
+      padding: 10px;
+      font-size: 16px;
+      margin-top: 20px;
+    }
+  </style>
+</head>
+<body>
+  <h1>🔮 Magic 8-Ball</h1>
+  <p>Ask a yes/no question:</p>
+  <input type="text" id="question" placeholder="Will I ace my test?" />
+  <br>
+  <button onclick="shakeBall()">Shake</button>
+  <h2 id="answer"></h2>
+
+  <script>
+    const responses = [
+      "Yes, definitely.",
+      "No way!",
+      "Ask again later.",
+      "It is certain.",
+      "Don't count on it.",
+      "Absolutely!",
+      "Better not tell you now.",
+      "Very doubtful.",
+      "Signs point to yes.",
+      "My sources say no."
+    ];
+
+    function shakeBall() {
+      const question = document.getElementById("question").value;
+      const answer = responses[Math.floor(Math.random() * responses.length)];
+      document.getElementById("answer").innerText = question ? answer : "Ask a question first!";
+    }
+  </script>
+</body>
+</html>
